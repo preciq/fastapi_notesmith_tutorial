@@ -2,17 +2,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+import notesmith.auth.models  # noqa: F401  — registers User with Base
+
 from notesmith.database import engine
+from notesmith.notes.router import router as notes_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: verify database connection
     async with engine.begin() as conn:
-        # This will raise if the database is unreachable
         await conn.run_sync(lambda conn: None)
     yield
-    # Shutdown: dispose of the connection pool
     await engine.dispose()
 
 
@@ -22,6 +22,8 @@ app = FastAPI(
     description="A notes API with AI capabilities.",
     lifespan=lifespan,
 )
+
+app.include_router(notes_router, prefix="/api/v1")
 
 
 @app.get("/health")
