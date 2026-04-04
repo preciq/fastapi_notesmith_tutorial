@@ -1,0 +1,18 @@
+[project]
+name = "notesmith"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "PrecIQ IO AI",email = "preciq@preciq.io"}
+]
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+]
+
+[tool.poetry]
+packages = [{include = "notesmith", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
