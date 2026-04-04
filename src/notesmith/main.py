@@ -2,8 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-import notesmith.auth.models  # noqa: F401  — registers User with Base
-
+from notesmith.auth.router import router as auth_router
 from notesmith.database import engine
 from notesmith.notes.router import router as notes_router
 
@@ -23,6 +22,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(auth_router, prefix="/api/v1")
 app.include_router(notes_router, prefix="/api/v1")
 
 
