@@ -448,6 +448,8 @@ Walk through the design decisions:
 
 The MCP server needs to be accessible over HTTP so external clients can connect. FastMCP provides an `http_app()` method that creates a Starlette/ASGI application, which you can mount on your FastAPI app.
 
+There is one critical requirement: the MCP app has its own internal lifespan that initializes session management and transport state. The [FastMCP documentation](https://gofastmcp.com/integrations/fastapi) requires connecting this lifespan to the host application. Since we already have a lifespan (for the database), we nest the MCP lifespan inside it via `mcp_app.router.lifespan_context`.
+
 Update `src/notesmith/main.py` to mount the MCP server:
 
 ```python
@@ -474,9 +476,17 @@ mcp_app = mcp_server.http_app(path="/mcp")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Database startup
     async with engine.begin() as conn:
         await conn.run_sync(lambda conn: None)
-    yield
+    # MCP server startup — required for the mounted MCP app to function.
+    # FastMCP's http_app() has an internal lifespan that initializes
+    # session management and transport state. The FastMCP documentation
+    # requires connecting it to the host application's lifespan.
+    # We nest it inside ours so both lifecycles run.
+    async with mcp_app.router.lifespan_context(mcp_app):
+        yield
+    # Database shutdown
     await engine.dispose()
 
 
@@ -534,9 +544,42 @@ async with Client("http://127.0.0.1:8000/mcp-server/mcp") as client:
 
 ## 11.6 Testing
 
-### Testing the MCP Server
+### The Session Isolation Problem
 
-The MCP server tools can be tested using FastMCP's in-memory transport. This bypasses HTTP entirely — the client talks directly to the server object in the same process.
+Before writing tests, there is an important issue to address. In Chapter 10, the REST API tests override `get_db` via `app.dependency_overrides` so that endpoints use the test database. MCP server tools do not go through FastAPI's dependency injection — they call `async_session_maker` directly from `notesmith.database`. This means:
+
+1. The tools connect to the **production** database, not the test database. A user created in the test session does not exist there.
+2. The production engine was created at import time on a different event loop. The in-memory MCP transport runs on the test's loop, causing `attached to a different loop` errors.
+
+The fix is the same pattern used for `@patch("notesmith.ai.service.client")` in the AI tests: patch the module-level `async_session_maker` that `server.py` imports, replacing it with the test session factory.
+
+### Update conftest.py
+
+Add a fixture to `tests/conftest.py` that patches the MCP server's session factory. Add this import at the top:
+
+```python
+from unittest.mock import patch
+```
+
+Then add this fixture after the existing `auth_headers` fixture:
+
+```python
+@pytest.fixture
+def patch_mcp_server_db():
+    """Redirect MCP server tools to the test database.
+
+    MCP tools use async_session_maker directly (they bypass FastAPI's
+    dependency injection). Without this patch, they connect to the
+    production database, which causes foreign key violations (the test
+    user does not exist there) and event loop mismatches.
+    """
+    with patch("notesmith.mcp.server.async_session_maker", test_session_maker):
+        yield
+```
+
+This replaces the production `async_session_maker` in the `notesmith.mcp.server` module with `test_session_maker` (already defined at module level in `conftest.py`) for the duration of the test. The tools then create sessions against the test database, where the test data lives.
+
+### Test File
 
 Create `tests/test_mcp.py`:
 
@@ -551,7 +594,6 @@ from mcp.types import TextContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from notesmith.mcp.server import mcp as mcp_server
-from notesmith.notes.models import Note
 
 
 # ----------------------------------------------------------------
@@ -560,7 +602,11 @@ from notesmith.notes.models import Note
 
 
 async def test_mcp_server_list_tools():
-    """Verify the MCP server exposes the expected tools."""
+    """Verify the MCP server exposes the expected tools.
+
+    This test does not touch the database — it only inspects the
+    tool registry, so it does not need the session patch.
+    """
     async with Client(mcp_server) as client:
         tools = await client.list_tools()
         tool_names = {t.name for t in tools}
@@ -570,9 +616,10 @@ async def test_mcp_server_list_tools():
         assert "search_notes" in tool_names
 
 
-async def test_mcp_server_create_and_get_note(db_session: AsyncSession):
+async def test_mcp_server_create_and_get_note(
+    db_session: AsyncSession, patch_mcp_server_db,
+):
     """Test creating a note via MCP and retrieving it."""
-    # Create a test user directly in the database
     from notesmith.auth.models import User
     from notesmith.auth.service import hash_password
 
@@ -609,8 +656,13 @@ async def test_mcp_server_create_and_get_note(db_session: AsyncSession):
         assert retrieved["content"] == "Created via MCP tools."
 
 
-async def test_mcp_server_get_nonexistent_note():
-    """Test that get_note returns an error for missing notes."""
+async def test_mcp_server_get_nonexistent_note(patch_mcp_server_db):
+    """Test that get_note returns an error for missing notes.
+
+    Even though no test data is needed, the tool still opens a
+    database session, so the patch is required to avoid the
+    'attached to a different loop' error.
+    """
     async with Client(mcp_server) as client:
         result = await client.call_tool("get_note", {"note_id": 99999})
         assert "error" in result.data
@@ -696,11 +748,13 @@ async def test_fetch_to_note_unauthenticated(client: AsyncClient):
 
 Walk through the testing patterns:
 
+**`patch_mcp_server_db` fixture.** This is the key addition. It patches `async_session_maker` inside the `notesmith.mcp.server` module with `test_session_maker`. Without it, MCP tools connect to the production database and fail. The same patching technique is used in `test_ai.py` for `@patch("notesmith.ai.service.client")` — replace a module-level object that the code under test imports.
+
+**Which tests need the patch.** Any test that calls an MCP tool which opens a database session needs `patch_mcp_server_db`. `test_mcp_server_list_tools` does not — it only inspects the tool registry, which is in-memory. The three REST API tests (`test_fetch_to_note`, `test_fetch_and_summarize`, `test_fetch_to_note_unauthenticated`) do not need it either — they test the FastAPI router endpoints, which use `get_db` (already overridden by the `client` fixture from conftest).
+
 **MCP server tests use in-memory transport.** `Client(mcp_server)` connects directly to the FastMCP server instance without any network or subprocess. This is fast and reliable for unit testing.
 
 **MCP client tests mock the client factory.** The `@patch("notesmith.mcp.client.create_fetch_client")` decorator replaces the function that creates the FastMCP Client with a mock. This prevents the tests from spawning a real `mcp-server-fetch` subprocess. The mock chain (`__aenter__`, `call_tool`, `content`) simulates the full async context manager lifecycle.
-
-**Combined mock test.** `test_fetch_and_summarize` mocks both the MCP client (for fetching) and the Anthropic client (for summarization). This verifies the full chain works without network calls.
 
 ### Running the Tests
 
@@ -812,7 +866,7 @@ tests/
 3. **FastMCP Server** — Exposing Python functions as MCP tools with automatic schema generation from type hints and docstrings.
 4. **Integration pattern** — Chaining MCP tools with existing services (database writes, AI summarization) to build compound features.
 5. **Mounting on FastAPI** — Serving the MCP server alongside REST endpoints in a single application using `http_app()` and `app.mount()`.
-6. **Testing** — In-memory transport for server tests, mock-based testing for client operations, combined mock tests for multi-service chains.
+6. **Testing** — In-memory transport for server tests, patching `async_session_maker` to redirect MCP tools to the test database, mock-based testing for client operations, combined mock tests for multi-service chains.
 
 ---
 
