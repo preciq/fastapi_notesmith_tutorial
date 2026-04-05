@@ -1,8 +1,8 @@
-# Chapter 11: Capstone Project — NoteSmith
+# Chapter 12: Capstone Project — NoteSmith
 
-You have built NoteSmith piece by piece across the previous ten chapters. This chapter consolidates everything into the final, complete application. It provides the definitive version of every file, adds the remaining production touches, and walks you through a full end-to-end test of the entire system.
+You have built NoteSmith piece by piece across the previous eleven chapters. This chapter consolidates everything into the final, complete application. It provides the definitive version of every file, adds the remaining production touches, and walks you through a full end-to-end test of the entire system.
 
-## 11.1 Final Project Structure
+## 12.1 Final Project Structure
 
 ```
 notesmith/
@@ -33,17 +33,24 @@ notesmith/
 │       │   ├── schemas.py
 │       │   ├── models.py
 │       │   └── service.py
-│       └── ai/
+│       ├── ai/
+│       │   ├── __init__.py
+│       │   ├── router.py
+│       │   ├── schemas.py
+│       │   └── service.py
+│       └── mcp/
 │           ├── __init__.py
-│           ├── router.py
+│           ├── client.py
 │           ├── schemas.py
-│           └── service.py
+│           ├── router.py
+│           └── server.py
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py
 │   ├── test_auth.py
 │   ├── test_notes.py
-│   └── test_ai.py
+│   ├── test_ai.py
+│   └── test_mcp.py
 ├── .env
 ├── alembic.ini
 ├── pyproject.toml
@@ -51,7 +58,7 @@ notesmith/
 └── README.md
 ```
 
-## 11.2 Complete File Listing
+## 12.2 Complete File Listing
 
 Below is the definitive, production-ready version of every file. If you followed the tutorial incrementally, your files should match these. If anything differs, update your files to match.
 
@@ -73,6 +80,8 @@ dependencies = [
     "pwdlib[argon2]",
     "pydantic-settings",
     "python-multipart",
+    "fastmcp",
+    "mcp-server-fetch",
 ]
 
 [tool.poetry]
@@ -249,8 +258,13 @@ from notesmith.ai.router import router as ai_router
 from notesmith.auth.router import router as auth_router
 from notesmith.database import engine
 from notesmith.exceptions import NoteSmithError
+from notesmith.mcp.router import router as mcp_router
+from notesmith.mcp.server import mcp as mcp_server
 from notesmith.middleware import RequestLoggingMiddleware
 from notesmith.notes.router import router as notes_router
+
+# Create the MCP ASGI app for mounting
+mcp_app = mcp_server.http_app(path="/mcp")
 
 
 @asynccontextmanager
@@ -278,10 +292,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
+# REST API routers
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(notes_router, prefix="/api/v1")
 app.include_router(ai_router, prefix="/api/v1")
+app.include_router(mcp_router, prefix="/api/v1")
+
+# MCP server mount — accessible at /mcp-server/mcp
+app.mount("/mcp-server", mcp_app)
 
 
 # Exception handlers
@@ -925,6 +943,329 @@ async def summarize_text_stream(request: SummarizeRequest, current_user: Current
     return StreamingResponse(generate(), media_type="text/plain")
 ```
 
+### src/notesmith/mcp/client.py
+
+```python
+import logging
+import sys
+
+from fastmcp import Client
+
+logger = logging.getLogger("notesmith.mcp")
+
+
+def create_fetch_client() -> Client:
+    """Create a FastMCP Client configured for the mcp-server-fetch server.
+
+    The fetch server runs as a subprocess over STDIO transport.
+    sys.executable ensures we use the same Python interpreter (and
+    therefore the same virtual environment) that is running the
+    FastAPI application. This guarantees that the installed
+    mcp-server-fetch package is available to the subprocess.
+    """
+    return Client(
+        {
+            "mcpServers": {
+                "fetch": {
+                    "command": sys.executable,
+                    "args": ["-m", "mcp_server_fetch"],
+                }
+            }
+        }
+    )
+
+
+async def fetch_url(url: str, max_length: int = 50000) -> str:
+    """Fetch a URL via the MCP fetch server and return its content as markdown.
+
+    Each call opens a fresh connection to the fetch server subprocess.
+    This is simpler than keeping a persistent connection and is
+    acceptable for the infrequent nature of web fetching operations.
+
+    Args:
+        url: The URL to fetch.
+        max_length: Maximum number of characters to return.
+
+    Returns:
+        The page content as markdown text.
+    """
+    client = create_fetch_client()
+    async with client:
+        result = await client.call_tool(
+            "fetch_fetch",
+            {"url": url, "max_length": max_length},
+        )
+        # result.content is a list of content blocks.
+        # The fetch tool returns a single TextContent block.
+        if result.content and hasattr(result.content[0], "text"):
+            return result.content[0].text
+        raise ValueError("Fetch server returned no text content")
+```
+
+### src/notesmith/mcp/schemas.py
+
+```python
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class FetchToNoteRequest(BaseModel):
+    url: str = Field(description="The URL to fetch and save as a note.")
+    title: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Optional title for the note. If omitted, the URL is used.",
+    )
+    max_length: int = Field(
+        default=50000,
+        gt=0,
+        le=100000,
+        description="Maximum characters to fetch from the page.",
+    )
+
+
+class FetchToNoteResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    content: str
+    owner_id: int
+    created_at: datetime
+
+
+class FetchAndSummarizeRequest(BaseModel):
+    url: str = Field(description="The URL to fetch and summarize.")
+    max_length: int = Field(
+        default=50000,
+        gt=0,
+        le=100000,
+        description="Maximum characters to fetch from the page.",
+    )
+
+
+class FetchAndSummarizeResponse(BaseModel):
+    url: str
+    summary: str
+```
+
+### src/notesmith/mcp/router.py
+
+```python
+import logging
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from notesmith.ai import service as ai_service
+from notesmith.auth.dependencies import CurrentUser
+from notesmith.database import get_db
+from notesmith.mcp import client as mcp_client
+from notesmith.mcp.schemas import (
+    FetchAndSummarizeRequest,
+    FetchAndSummarizeResponse,
+    FetchToNoteRequest,
+    FetchToNoteResponse,
+)
+from notesmith.notes.models import Note
+
+logger = logging.getLogger("notesmith.mcp")
+
+router = APIRouter(prefix="/mcp", tags=["mcp"])
+
+DB = Annotated[AsyncSession, Depends(get_db)]
+
+
+@router.post("/fetch-to-note", response_model=FetchToNoteResponse, status_code=201)
+async def fetch_to_note(
+    request: FetchToNoteRequest,
+    db: DB,
+    current_user: CurrentUser,
+):
+    """Fetch a web page via the MCP fetch server and save it as a note."""
+    try:
+        content = await mcp_client.fetch_url(
+            request.url, max_length=request.max_length
+        )
+    except Exception as e:
+        logger.error("MCP fetch failed for %s: %s", request.url, e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to fetch URL: {request.url}",
+        )
+
+    title = request.title or request.url[:200]
+
+    note = Note(
+        title=title,
+        content=content,
+        owner_id=current_user.id,
+    )
+    db.add(note)
+    await db.flush()
+    return note
+
+
+@router.post("/fetch-and-summarize", response_model=FetchAndSummarizeResponse)
+async def fetch_and_summarize(
+    request: FetchAndSummarizeRequest,
+    current_user: CurrentUser,
+):
+    """Fetch a web page and summarize it with Claude."""
+    try:
+        content = await mcp_client.fetch_url(
+            request.url, max_length=request.max_length
+        )
+    except Exception as e:
+        logger.error("MCP fetch failed for %s: %s", request.url, e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to fetch URL: {request.url}",
+        )
+
+    try:
+        summary = await ai_service.summarize_text(content)
+    except Exception as e:
+        logger.error("Summarization failed for %s: %s", request.url, e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI summarization failed",
+        )
+
+    return FetchAndSummarizeResponse(url=request.url, summary=summary)
+```
+
+### src/notesmith/mcp/server.py
+
+```python
+from fastmcp import FastMCP
+
+from notesmith.database import async_session_maker
+from notesmith.notes import service as notes_service
+from notesmith.notes.schemas import NoteCreate
+
+mcp = FastMCP(
+    "NoteSmith",
+    instructions=(
+        "NoteSmith is a notes API. Use these tools to list, retrieve, "
+        "create, and search notes for a given user."
+    ),
+)
+
+
+@mcp.tool
+async def list_notes(owner_id: int, skip: int = 0, limit: int = 50) -> list[dict]:
+    """List all notes for a user, ordered by creation date (newest first).
+
+    Args:
+        owner_id: The ID of the user whose notes to list.
+        skip: Number of notes to skip (for pagination).
+        limit: Maximum number of notes to return.
+    """
+    async with async_session_maker() as session:
+        notes = await notes_service.get_notes_by_owner(
+            session, owner_id, skip=skip, limit=limit
+        )
+        return [
+            {
+                "id": n.id,
+                "title": n.title,
+                "content": n.content[:200] + "..." if len(n.content) > 200 else n.content,
+                "is_pinned": n.is_pinned,
+                "created_at": n.created_at.isoformat(),
+            }
+            for n in notes
+        ]
+
+
+@mcp.tool
+async def get_note(note_id: int) -> dict:
+    """Get the full content of a specific note by its ID.
+
+    Args:
+        note_id: The ID of the note to retrieve.
+    """
+    async with async_session_maker() as session:
+        note = await notes_service.get_note_by_id(session, note_id)
+        if note is None:
+            return {"error": f"Note {note_id} not found"}
+        return {
+            "id": note.id,
+            "title": note.title,
+            "content": note.content,
+            "is_pinned": note.is_pinned,
+            "summary": note.summary,
+            "owner_id": note.owner_id,
+            "created_at": note.created_at.isoformat(),
+            "updated_at": note.updated_at.isoformat(),
+        }
+
+
+@mcp.tool
+async def create_note(owner_id: int, title: str, content: str, is_pinned: bool = False) -> dict:
+    """Create a new note for a user.
+
+    Args:
+        owner_id: The ID of the user who owns the note.
+        title: The title of the note (max 200 characters).
+        content: The content of the note.
+        is_pinned: Whether to pin the note (default: false).
+    """
+    note_data = NoteCreate(title=title, content=content, is_pinned=is_pinned)
+    async with async_session_maker() as session:
+        note = await notes_service.create_note(session, note_data, owner_id)
+        await session.commit()
+        return {
+            "id": note.id,
+            "title": note.title,
+            "content": note.content,
+            "is_pinned": note.is_pinned,
+            "owner_id": note.owner_id,
+            "created_at": note.created_at.isoformat(),
+        }
+
+
+@mcp.tool
+async def search_notes(owner_id: int, query: str) -> list[dict]:
+    """Search notes by keyword in title or content.
+
+    Args:
+        owner_id: The ID of the user whose notes to search.
+        query: The search term to look for in note titles and content.
+    """
+    from sqlalchemy import select, or_
+
+    from notesmith.notes.models import Note
+
+    async with async_session_maker() as session:
+        stmt = (
+            select(Note)
+            .where(
+                Note.owner_id == owner_id,
+                or_(
+                    Note.title.ilike(f"%{query}%"),
+                    Note.content.ilike(f"%{query}%"),
+                ),
+            )
+            .order_by(Note.created_at.desc())
+            .limit(20)
+        )
+        result = await session.execute(stmt)
+        notes = result.scalars().all()
+        return [
+            {
+                "id": n.id,
+                "title": n.title,
+                "content": n.content[:200] + "..." if len(n.content) > 200 else n.content,
+                "is_pinned": n.is_pinned,
+                "created_at": n.created_at.isoformat(),
+            }
+            for n in notes
+        ]
+```
+
 ### alembic/env.py
 
 ```python
@@ -1358,7 +1699,158 @@ async def test_analyze_invalid_type(client: AsyncClient, auth_headers):
     assert response.status_code == 422
 ```
 
-## 11.3 End-to-End Verification
+### tests/test_mcp.py
+
+```python
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from anthropic.types import TextBlock
+from fastmcp import Client
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from notesmith.mcp.server import mcp as mcp_server
+
+
+# ----------------------------------------------------------------
+# MCP Server Tests (in-memory transport, no HTTP)
+# ----------------------------------------------------------------
+
+
+async def test_mcp_server_list_tools():
+    """Verify the MCP server exposes the expected tools."""
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+        tool_names = {t.name for t in tools}
+        assert "list_notes" in tool_names
+        assert "get_note" in tool_names
+        assert "create_note" in tool_names
+        assert "search_notes" in tool_names
+
+
+async def test_mcp_server_create_and_get_note(db_session: AsyncSession):
+    """Test creating a note via MCP and retrieving it."""
+    from notesmith.auth.models import User
+    from notesmith.auth.service import hash_password
+
+    user = User(
+        email="mcpuser@example.com",
+        username="mcpuser",
+        hashed_password=hash_password("testpassword123"),
+        is_active=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    async with Client(mcp_server) as client:
+        # Create a note
+        create_result = await client.call_tool(
+            "create_note",
+            {
+                "owner_id": user.id,
+                "title": "MCP Test Note",
+                "content": "Created via MCP tools.",
+            },
+        )
+        note_data = create_result.data
+        assert note_data["title"] == "MCP Test Note"
+        assert "id" in note_data
+
+        # Retrieve the same note
+        get_result = await client.call_tool(
+            "get_note", {"note_id": note_data["id"]}
+        )
+        retrieved = get_result.data
+        assert retrieved["title"] == "MCP Test Note"
+        assert retrieved["content"] == "Created via MCP tools."
+
+
+async def test_mcp_server_get_nonexistent_note():
+    """Test that get_note returns an error for missing notes."""
+    async with Client(mcp_server) as client:
+        result = await client.call_tool("get_note", {"note_id": 99999})
+        assert "error" in result.data
+
+
+# ----------------------------------------------------------------
+# MCP Client Router Tests (REST API endpoints)
+# ----------------------------------------------------------------
+
+
+@patch("notesmith.mcp.client.create_fetch_client")
+async def test_fetch_to_note(
+    mock_create_client, client: AsyncClient, auth_headers, db_session,
+):
+    """Test the fetch-to-note endpoint with a mocked MCP client."""
+    mock_mcp = AsyncMock()
+    mock_content = MagicMock()
+    mock_content.text = "# Example Page\n\nThis is the fetched content."
+    mock_result = MagicMock()
+    mock_result.content = [mock_content]
+    mock_mcp.call_tool = AsyncMock(return_value=mock_result)
+    mock_mcp.__aenter__ = AsyncMock(return_value=mock_mcp)
+    mock_mcp.__aexit__ = AsyncMock(return_value=False)
+    mock_create_client.return_value = mock_mcp
+
+    response = await client.post(
+        "/api/v1/mcp/fetch-to-note",
+        headers=auth_headers,
+        json={"url": "https://example.com", "title": "Example"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["title"] == "Example"
+    assert "fetched content" in data["content"]
+
+
+@patch("notesmith.ai.service.client")
+@patch("notesmith.mcp.client.create_fetch_client")
+async def test_fetch_and_summarize(
+    mock_create_client,
+    mock_ai_client,
+    client: AsyncClient,
+    auth_headers,
+):
+    """Test the fetch-and-summarize endpoint with mocked MCP and AI clients."""
+    # Mock MCP fetch
+    mock_mcp = AsyncMock()
+    mock_content = MagicMock()
+    mock_content.text = "Long article content about FastAPI and Python."
+    mock_result = MagicMock()
+    mock_result.content = [mock_content]
+    mock_mcp.call_tool = AsyncMock(return_value=mock_result)
+    mock_mcp.__aenter__ = AsyncMock(return_value=mock_mcp)
+    mock_mcp.__aexit__ = AsyncMock(return_value=False)
+    mock_create_client.return_value = mock_mcp
+
+    # Mock Anthropic AI
+    block = TextBlock(type="text", text="A concise summary of the article.")
+    message = MagicMock()
+    message.content = [block]
+    mock_ai_client.messages.create = AsyncMock(return_value=message)
+
+    response = await client.post(
+        "/api/v1/mcp/fetch-and-summarize",
+        headers=auth_headers,
+        json={"url": "https://example.com/article"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["url"] == "https://example.com/article"
+    assert data["summary"] == "A concise summary of the article."
+
+
+async def test_fetch_to_note_unauthenticated(client: AsyncClient):
+    """MCP endpoints require authentication."""
+    response = await client.post(
+        "/api/v1/mcp/fetch-to-note",
+        json={"url": "https://example.com"},
+    )
+    assert response.status_code == 401
+```
+
+## 12.3 End-to-End Verification
 
 Follow these steps to verify the complete system works.
 
@@ -1473,7 +1965,38 @@ curl -X POST http://127.0.0.1:8000/api/v1/ai/summarize/stream \
   -d '{"text": "FastAPI is a modern web framework for building APIs with Python 3.10+ based on standard type hints. It provides automatic data validation, serialization, and interactive API documentation."}'
 ```
 
-### Step 6: Run Tests
+### Step 6: MCP Features
+
+```bash
+# Fetch a web page and save it as a note
+curl -s -X POST http://127.0.0.1:8000/api/v1/mcp/fetch-to-note \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com", "title": "Example.com"}' | python -m json.tool
+
+# Fetch a web page and summarize it
+curl -s -X POST http://127.0.0.1:8000/api/v1/mcp/fetch-and-summarize \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}' | python -m json.tool
+
+# Connect to the MCP server as a client
+python -c "
+import asyncio
+from fastmcp import Client
+
+async def main():
+    async with Client('http://127.0.0.1:8000/mcp-server/mcp') as client:
+        tools = await client.list_tools()
+        print('MCP tools:')
+        for t in tools:
+            print(f'  {t.name}')
+
+asyncio.run(main())
+"
+```
+
+### Step 7: Run Tests
 
 ```bash
 pytest -v
@@ -1481,7 +2004,9 @@ pytest -v
 
 All tests should pass.
 
-## 11.4 API Endpoint Summary
+## 12.4 API Endpoint Summary
+
+### REST API
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
@@ -1498,10 +2023,21 @@ All tests should pass.
 | POST | `/api/v1/ai/summarize/stream` | Yes | Stream a summary |
 | POST | `/api/v1/ai/analyze` | Yes | Analyze text (sentiment, topics, actions) |
 | POST | `/api/v1/ai/notes/{id}/summarize` | Yes | Summarize a note and save the result |
+| POST | `/api/v1/mcp/fetch-to-note` | Yes | Fetch a URL via MCP and save as a note |
+| POST | `/api/v1/mcp/fetch-and-summarize` | Yes | Fetch a URL via MCP and summarize with Claude |
 
-## 11.5 What This Tutorial Covered
+### MCP Server (at `/mcp-server/mcp`)
 
-Across 11 chapters, you learned:
+| Tool | Description |
+|------|-------------|
+| `list_notes` | List all notes for a user |
+| `get_note` | Get the full content of a note |
+| `create_note` | Create a new note |
+| `search_notes` | Search notes by keyword |
+
+## 12.5 What This Tutorial Covered
+
+Across 12 chapters, you learned:
 
 1. **Poetry** — Project creation, PEP 621 metadata, dependency management, virtual environments, lock files.
 2. **FastAPI** — Routing, path/query parameters, request bodies, status codes, response models, APIRouter.
@@ -1513,16 +2049,19 @@ Across 11 chapters, you learned:
 8. **Dependency injection** — Generator dependencies with yield, caching, class-based dependencies, middleware (CORS, request logging), custom exception handling.
 9. **Anthropic SDK** — AsyncAnthropic client, Messages API, system prompts, TextBlock type checking, streaming responses, error handling for external services.
 10. **Testing** — pytest-asyncio configuration, httpx AsyncClient with ASGITransport, dependency overrides, PostgreSQL test database, mock fixtures for external APIs.
+11. **MCP integration** — FastMCP Client for consuming external MCP servers (STDIO transport, tool calling), FastMCP Server for exposing application tools, mounting MCP servers on FastAPI, in-memory transport testing.
 
-## 11.6 Where to Go from Here
+## 12.6 Where to Go from Here
 
 This tutorial built a solid foundation. Here are natural next steps:
 
 - **Docker** — Containerize the application with a `Dockerfile` and `docker-compose.yml` for PostgreSQL.
-- **Rate limiting** — Add per-user rate limits to the AI endpoints using `slowapi` or custom middleware.
+- **Rate limiting** — Add per-user rate limits to the AI and MCP endpoints using `slowapi` or custom middleware.
 - **Pagination** — Replace the simple skip/limit with cursor-based pagination for better performance at scale.
 - **Background tasks** — Use FastAPI's `BackgroundTasks` or Celery for long-running AI operations.
 - **Refresh tokens** — Add a token refresh flow for longer sessions without re-entering credentials.
+- **MCP authentication** — Add OAuth or JWT auth to the MCP server using FastMCP's auth providers.
+- **MCP deployment** — Deploy the MCP server to Prefect Horizon for free public hosting.
 - **Logging and monitoring** — Structured logging with `structlog`, metrics with Prometheus.
 - **CI/CD** — GitHub Actions pipeline running tests, linting, and deployment.
 - **Frontend** — Build a frontend with Svelte 5 and SvelteKit to consume this API.
