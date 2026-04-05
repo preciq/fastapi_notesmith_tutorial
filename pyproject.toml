@@ -2,11 +2,9 @@
 name = "notesmith"
 version = "0.1.0"
 description = ""
-authors = [
-    {name = "PrecIQ IO AI",email = "preciq@preciq.io"}
-]
+authors = [{ name = "PrecIQ IO AI", email = "preciq@preciq.io" }]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<4.0"
 dependencies = [
     "fastapi[standard] (>=0.135.3,<0.136.0)",
     "sqlalchemy[asyncio] (>=2.0.49,<3.0.0)",
@@ -16,7 +14,8 @@ dependencies = [
     "pyjwt (>=2.12.1,<3.0.0)",
     "pwdlib[argon2] (>=0.3.0,<0.4.0)",
     "pydantic-settings (>=2.13.1,<3.0.0)",
-    "python-multipart (>=0.0.22,<0.0.23)"
+    "python-multipart (>=0.0.22,<0.0.23)",
+    "fastmcp (>=3.2.0,<4.0.0)",
 ]
 
 [build-system]
