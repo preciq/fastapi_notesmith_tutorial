@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str
+    test_database_url: str | None = None  # Only needed when running tests
 
     # Authentication
     jwt_secret_key: str
@@ -23,7 +24,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()  # type: ignore[call-arg]
-
 
 """
 Import this anywhere: 
