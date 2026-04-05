@@ -20,9 +20,17 @@ mcp_app = mcp_server.http_app(path="/mcp")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Database startup
     async with engine.begin() as conn:
         await conn.run_sync(lambda conn: None)
-    yield
+    # MCP server startup — required for the mounted MCP app to function.
+    # FastMCP's http_app() has an internal lifespan that initializes
+    # session management and transport state. The FastMCP documentation
+    # requires connecting it to the host application's lifespan.
+    # We nest it inside ours so both lifecycles run.
+    async with mcp_app.router.lifespan_context(mcp_app):
+        yield
+    # Database shutdown
     await engine.dispose()
 
 

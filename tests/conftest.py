@@ -1,5 +1,6 @@
 from typing import AsyncGenerator
 from sqlalchemy.pool import NullPool
+from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -90,3 +91,16 @@ def auth_headers(test_user: User) -> dict[str, str]:
     """Return Authorization headers with a valid JWT for the test user."""
     token = create_access_token(subject=str(test_user.id))
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def patch_mcp_server_db():
+    """Redirect MCP server tools to the test database.
+
+    MCP tools use async_session_maker directly (they bypass FastAPI's
+    dependency injection). Without this patch, they connect to the
+    production database, which causes foreign key violations (the test
+    user does not exist there) and event loop mismatches.
+    """
+    with patch("notesmith.mcp.server.async_session_maker", test_session_maker):
+        yield
