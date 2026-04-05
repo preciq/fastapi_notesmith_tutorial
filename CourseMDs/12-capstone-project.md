@@ -81,7 +81,6 @@ dependencies = [
     "pydantic-settings",
     "python-multipart",
     "fastmcp",
-    "mcp-server-fetch",
 ]
 
 [tool.poetry]
@@ -263,15 +262,24 @@ from notesmith.mcp.server import mcp as mcp_server
 from notesmith.middleware import RequestLoggingMiddleware
 from notesmith.notes.router import router as notes_router
 
-# Create the MCP ASGI app for mounting
+# Create the MCP ASGI app. The path parameter sets the endpoint
+# within the mounted sub-application (default is "/mcp").
 mcp_app = mcp_server.http_app(path="/mcp")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Database startup
     async with engine.begin() as conn:
         await conn.run_sync(lambda conn: None)
-    yield
+    # MCP server startup — required for the mounted MCP app to function.
+    # FastMCP's http_app() has an internal lifespan that initializes
+    # session management and transport state. The FastMCP documentation
+    # requires connecting it to the host application's lifespan.
+    # We nest it inside ours so both lifecycles run.
+    async with mcp_app.router.lifespan_context(mcp_app):
+        yield
+    # Database shutdown
     await engine.dispose()
 
 
@@ -947,9 +955,9 @@ async def summarize_text_stream(request: SummarizeRequest, current_user: Current
 
 ```python
 import logging
-import sys
 
 from fastmcp import Client
+from mcp.types import TextContent
 
 logger = logging.getLogger("notesmith.mcp")
 
@@ -958,17 +966,17 @@ def create_fetch_client() -> Client:
     """Create a FastMCP Client configured for the mcp-server-fetch server.
 
     The fetch server runs as a subprocess over STDIO transport.
-    sys.executable ensures we use the same Python interpreter (and
-    therefore the same virtual environment) that is running the
-    FastAPI application. This guarantees that the installed
-    mcp-server-fetch package is available to the subprocess.
+    We use uvx to launch it in an isolated environment rather than
+    installing it into our project's virtual environment. This avoids
+    dependency conflicts — mcp-server-fetch pins httpx <0.28, while
+    our project requires httpx >=0.28.1.
     """
     return Client(
         {
             "mcpServers": {
                 "fetch": {
-                    "command": sys.executable,
-                    "args": ["-m", "mcp_server_fetch"],
+                    "command": "uvx",
+                    "args": ["mcp-server-fetch"],
                 }
             }
         }
@@ -997,17 +1005,19 @@ async def fetch_url(url: str, max_length: int = 50000) -> str:
         )
         # result.content is a list of content blocks.
         # The fetch tool returns a single TextContent block.
-        if result.content and hasattr(result.content[0], "text"):
-            return result.content[0].text
-        raise ValueError("Fetch server returned no text content")
+        if not result.content:
+            raise ValueError("Fetch server returned no content")
+        text_block = result.content[0]
+        if not isinstance(text_block, TextContent):
+            raise ValueError("Fetch server returned non-text content")
+        return text_block.text
 ```
 
 ### src/notesmith/mcp/schemas.py
 
 ```python
-from datetime import datetime
-
 from pydantic import BaseModel, ConfigDict, Field
+from datetime import datetime
 
 
 class FetchToNoteRequest(BaseModel):
@@ -1341,6 +1351,7 @@ else:
 
 ```python
 from typing import AsyncGenerator
+from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -1421,6 +1432,19 @@ async def test_user(db_session: AsyncSession) -> User:
 def auth_headers(test_user: User) -> dict[str, str]:
     token = create_access_token(subject=str(test_user.id))
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def patch_mcp_server_db():
+    """Redirect MCP server tools to the test database.
+
+    MCP tools use async_session_maker directly (they bypass FastAPI's
+    dependency injection). Without this patch, they connect to the
+    production database, which causes foreign key violations (the test
+    user does not exist there) and event loop mismatches.
+    """
+    with patch("notesmith.mcp.server.async_session_maker", test_session_maker):
+        yield
 ```
 
 ### tests/test_auth.py
@@ -1707,6 +1731,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from anthropic.types import TextBlock
 from fastmcp import Client
 from httpx import AsyncClient
+from mcp.types import TextContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from notesmith.mcp.server import mcp as mcp_server
@@ -1728,7 +1753,9 @@ async def test_mcp_server_list_tools():
         assert "search_notes" in tool_names
 
 
-async def test_mcp_server_create_and_get_note(db_session: AsyncSession):
+async def test_mcp_server_create_and_get_note(
+    db_session: AsyncSession, patch_mcp_server_db,
+):
     """Test creating a note via MCP and retrieving it."""
     from notesmith.auth.models import User
     from notesmith.auth.service import hash_password
@@ -1766,7 +1793,7 @@ async def test_mcp_server_create_and_get_note(db_session: AsyncSession):
         assert retrieved["content"] == "Created via MCP tools."
 
 
-async def test_mcp_server_get_nonexistent_note():
+async def test_mcp_server_get_nonexistent_note(patch_mcp_server_db):
     """Test that get_note returns an error for missing notes."""
     async with Client(mcp_server) as client:
         result = await client.call_tool("get_note", {"note_id": 99999})
@@ -1784,8 +1811,7 @@ async def test_fetch_to_note(
 ):
     """Test the fetch-to-note endpoint with a mocked MCP client."""
     mock_mcp = AsyncMock()
-    mock_content = MagicMock()
-    mock_content.text = "# Example Page\n\nThis is the fetched content."
+    mock_content = TextContent(type="text", text="# Example Page\n\nThis is the fetched content.")
     mock_result = MagicMock()
     mock_result.content = [mock_content]
     mock_mcp.call_tool = AsyncMock(return_value=mock_result)
@@ -1813,10 +1839,8 @@ async def test_fetch_and_summarize(
     auth_headers,
 ):
     """Test the fetch-and-summarize endpoint with mocked MCP and AI clients."""
-    # Mock MCP fetch
     mock_mcp = AsyncMock()
-    mock_content = MagicMock()
-    mock_content.text = "Long article content about FastAPI and Python."
+    mock_content = TextContent(type="text", text="Long article content about FastAPI and Python.")
     mock_result = MagicMock()
     mock_result.content = [mock_content]
     mock_mcp.call_tool = AsyncMock(return_value=mock_result)
@@ -1824,7 +1848,6 @@ async def test_fetch_and_summarize(
     mock_mcp.__aexit__ = AsyncMock(return_value=False)
     mock_create_client.return_value = mock_mcp
 
-    # Mock Anthropic AI
     block = TextBlock(type="text", text="A concise summary of the article.")
     message = MagicMock()
     message.content = [block]
@@ -1944,7 +1967,7 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/ai/analyze \
   -H "Content-Type: application/json" \
   -d '{"text": "The meeting was extremely productive and everyone left feeling motivated about the direction.", "analysis_type": "sentiment"}' | python -m json.tool
 
-# Extract action items from a note
+# Extract action items
 curl -s -X POST http://127.0.0.1:8000/api/v1/ai/analyze \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -1952,10 +1975,6 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/ai/analyze \
 
 # Summarize a note and store the result (replace 2 with your note ID)
 curl -s -X POST http://127.0.0.1:8000/api/v1/ai/notes/2/summarize \
-  -H "Authorization: Bearer $TOKEN" | python -m json.tool
-
-# Verify the summary was saved
-curl -s http://127.0.0.1:8000/api/v1/notes/2 \
   -H "Authorization: Bearer $TOKEN" | python -m json.tool
 
 # Stream a summary
@@ -1974,13 +1993,16 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/mcp/fetch-to-note \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com", "title": "Example.com"}' | python -m json.tool
 
-# Fetch a web page and summarize it
+# Fetch a page and summarize it with Claude
 curl -s -X POST http://127.0.0.1:8000/api/v1/mcp/fetch-and-summarize \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com"}' | python -m json.tool
+```
 
-# Connect to the MCP server as a client
+Test the MCP server with an external client:
+
+```bash
 python -c "
 import asyncio
 from fastmcp import Client
@@ -1988,9 +2010,12 @@ from fastmcp import Client
 async def main():
     async with Client('http://127.0.0.1:8000/mcp-server/mcp') as client:
         tools = await client.list_tools()
-        print('MCP tools:')
+        print('Available MCP tools:')
         for t in tools:
             print(f'  {t.name}')
+
+        result = await client.call_tool('list_notes', {'owner_id': 1})
+        print(f'\nNotes: {result.data}')
 
 asyncio.run(main())
 "
@@ -2005,8 +2030,6 @@ pytest -v
 All tests should pass.
 
 ## 12.4 API Endpoint Summary
-
-### REST API
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
@@ -2023,17 +2046,9 @@ All tests should pass.
 | POST | `/api/v1/ai/summarize/stream` | Yes | Stream a summary |
 | POST | `/api/v1/ai/analyze` | Yes | Analyze text (sentiment, topics, actions) |
 | POST | `/api/v1/ai/notes/{id}/summarize` | Yes | Summarize a note and save the result |
-| POST | `/api/v1/mcp/fetch-to-note` | Yes | Fetch a URL via MCP and save as a note |
-| POST | `/api/v1/mcp/fetch-and-summarize` | Yes | Fetch a URL via MCP and summarize with Claude |
-
-### MCP Server (at `/mcp-server/mcp`)
-
-| Tool | Description |
-|------|-------------|
-| `list_notes` | List all notes for a user |
-| `get_note` | Get the full content of a note |
-| `create_note` | Create a new note |
-| `search_notes` | Search notes by keyword |
+| POST | `/api/v1/mcp/fetch-to-note` | Yes | Fetch a URL and save as a note |
+| POST | `/api/v1/mcp/fetch-and-summarize` | Yes | Fetch a URL and summarize with Claude |
+| — | `/mcp-server/mcp` | No | MCP server (tools: list, get, create, search notes) |
 
 ## 12.5 What This Tutorial Covered
 
@@ -2049,19 +2064,18 @@ Across 12 chapters, you learned:
 8. **Dependency injection** — Generator dependencies with yield, caching, class-based dependencies, middleware (CORS, request logging), custom exception handling.
 9. **Anthropic SDK** — AsyncAnthropic client, Messages API, system prompts, TextBlock type checking, streaming responses, error handling for external services.
 10. **Testing** — pytest-asyncio configuration, httpx AsyncClient with ASGITransport, dependency overrides, PostgreSQL test database, mock fixtures for external APIs.
-11. **MCP integration** — FastMCP Client for consuming external MCP servers (STDIO transport, tool calling), FastMCP Server for exposing application tools, mounting MCP servers on FastAPI, in-memory transport testing.
+11. **MCP** — FastMCP client (STDIO transport, `uvx` for dependency isolation), FastMCP server (tool registration from type hints/docstrings), mounting on FastAPI with lifespan nesting, session factory patching for test isolation.
 
 ## 12.6 Where to Go from Here
 
 This tutorial built a solid foundation. Here are natural next steps:
 
 - **Docker** — Containerize the application with a `Dockerfile` and `docker-compose.yml` for PostgreSQL.
-- **Rate limiting** — Add per-user rate limits to the AI and MCP endpoints using `slowapi` or custom middleware.
+- **Rate limiting** — Add per-user rate limits to the AI endpoints using `slowapi` or custom middleware.
 - **Pagination** — Replace the simple skip/limit with cursor-based pagination for better performance at scale.
 - **Background tasks** — Use FastAPI's `BackgroundTasks` or Celery for long-running AI operations.
 - **Refresh tokens** — Add a token refresh flow for longer sessions without re-entering credentials.
-- **MCP authentication** — Add OAuth or JWT auth to the MCP server using FastMCP's auth providers.
-- **MCP deployment** — Deploy the MCP server to Prefect Horizon for free public hosting.
 - **Logging and monitoring** — Structured logging with `structlog`, metrics with Prometheus.
 - **CI/CD** — GitHub Actions pipeline running tests, linting, and deployment.
+- **Advanced MCP** — Add OAuth authentication to the MCP server, deploy to Prefect Horizon, or connect additional MCP servers (filesystem, memory, git).
 - **Frontend** — Build a frontend with Svelte 5 and SvelteKit to consume this API.
