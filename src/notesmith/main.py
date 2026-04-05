@@ -4,21 +4,25 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from notesmith.ai.router import router as ai_router
 from notesmith.auth.router import router as auth_router
 from notesmith.database import engine
 from notesmith.exceptions import NoteSmithError
+from notesmith.mcp.router import router as mcp_router
+from notesmith.mcp.server import mcp as mcp_server
 from notesmith.middleware import RequestLoggingMiddleware
 from notesmith.notes.router import router as notes_router
-from notesmith.ai.router import router as ai_router
+
+# Create the MCP ASGI app. The path parameter sets the endpoint
+# within the mounted sub-application (default is "/mcp").
+mcp_app = mcp_server.http_app(path="/mcp")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: verify database connection
     async with engine.begin() as conn:
         await conn.run_sync(lambda conn: None)
     yield
-    # Shutdown: dispose of the connection pool
     await engine.dispose()
 
 
@@ -39,10 +43,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
+# REST API routers
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(notes_router, prefix="/api/v1")
 app.include_router(ai_router, prefix="/api/v1")
+app.include_router(mcp_router, prefix="/api/v1")
+
+# MCP server mount — accessible at /mcp-server/mcp
+app.mount("/mcp-server", mcp_app)
 
 
 # Exception handlers

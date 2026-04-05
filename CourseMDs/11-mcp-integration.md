@@ -80,6 +80,7 @@ Open `src/notesmith/mcp/client.py`:
 import logging
 
 from fastmcp import Client
+from mcp.types import TextContent
 
 logger = logging.getLogger("notesmith.mcp")
 
@@ -127,9 +128,12 @@ async def fetch_url(url: str, max_length: int = 50000) -> str:
         )
         # result.content is a list of content blocks.
         # The fetch tool returns a single TextContent block.
-        if result.content and hasattr(result.content[0], "text"):
-            return result.content[0].text
-        raise ValueError("Fetch server returned no text content")
+        if not result.content:
+            raise ValueError("Fetch server returned no content")
+        text_block = result.content[0]
+        if not isinstance(text_block, TextContent):
+            raise ValueError("Fetch server returned non-text content")
+        return text_block.text
 ```
 
 Key points:
@@ -543,6 +547,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from anthropic.types import TextBlock
 from fastmcp import Client
 from httpx import AsyncClient
+from mcp.types import TextContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from notesmith.mcp.server import mcp as mcp_server
@@ -622,10 +627,10 @@ async def test_fetch_to_note(
 ):
     """Test the fetch-to-note endpoint with a mocked MCP client."""
     # Set up the mock chain: create_fetch_client() returns a mock Client
-    # whose __aenter__ returns itself, and call_tool returns a result
+    # whose __aenter__ returns itself, and call_tool returns a result.
+    # Use real TextContent so isinstance() checks in client.py pass.
     mock_mcp = AsyncMock()
-    mock_content = MagicMock()
-    mock_content.text = "# Example Page\n\nThis is the fetched content."
+    mock_content = TextContent(type="text", text="# Example Page\n\nThis is the fetched content.")
     mock_result = MagicMock()
     mock_result.content = [mock_content]
     mock_mcp.call_tool = AsyncMock(return_value=mock_result)
@@ -655,8 +660,7 @@ async def test_fetch_and_summarize(
     """Test the fetch-and-summarize endpoint with mocked MCP and AI clients."""
     # Mock MCP fetch
     mock_mcp = AsyncMock()
-    mock_content = MagicMock()
-    mock_content.text = "Long article content about FastAPI and Python."
+    mock_content = TextContent(type="text", text="Long article content about FastAPI and Python.")
     mock_result = MagicMock()
     mock_result.content = [mock_content]
     mock_mcp.call_tool = AsyncMock(return_value=mock_result)
