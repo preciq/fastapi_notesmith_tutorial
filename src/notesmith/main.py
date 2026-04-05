@@ -9,6 +9,7 @@ from notesmith.database import engine
 from notesmith.exceptions import NoteSmithError
 from notesmith.middleware import RequestLoggingMiddleware
 from notesmith.notes.router import router as notes_router
+from notesmith.ai.router import router as ai_router
 
 
 @asynccontextmanager
@@ -41,6 +42,7 @@ app.add_middleware(
 # Routers
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(notes_router, prefix="/api/v1")
+app.include_router(ai_router, prefix="/api/v1")
 
 
 # Exception handlers
